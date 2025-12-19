@@ -1,3 +1,4 @@
+
 #include <Arduino.h>
 #include <SPI.h>
 // SPI Setup
@@ -5,8 +6,8 @@
 #define CHIP_SELECT_PIN 4
 
 // Set to 1 for Anchor 1, 2 for Anchor 2
-#define ANCHOR_ID 1
-#define RESPONSE_TIMEOUT_MS 10 // Maximum time to wait for a response
+#define ANCHOR_ID 4
+#define RESPONSE_TIMEOUT_MS 100 // Maximum time to wait for a response
 unsigned long last_ranging_time = 0;
 #define MAX_RETRIES 3
 int retry_count = 0;
@@ -1795,6 +1796,7 @@ void loop()
           }
           else
           {
+            DWM3000.setDestinationID(DWM3000.getSenderID());
             curr_stage = 1; // Move to send response
           }
         }

@@ -6,200 +6,185 @@ import matplotlib.image as mpimg
 import numpy as np
 from scipy.optimize import least_squares
 import json
+import os
 
 # ---------------- CONFIGURATION ---------------- #
-HOST = "192.168.xx.xx"  # Your PC's IP address
-PORT = 7007  # Must match ESP32 port
-ANCHOR_POSITIONS = np.array(
-    [[15, 5], [290, 5], [165, 625]]  # Anchor 1  # Anchor 2  # Anchor 3
-)
-MARGIN = 20  # For dynamic zoom (not needed for fixed view)
-ROOM_WIDTH = 480  # cm
-ROOM_HEIGHT = 650  # cm
-IMAGE_FILE = "floorplan.png"  # Background image of your room
+HOST = "0.0.0.0"
+PORT = 7007
+
+ROOM_WIDTH = 300
+ROOM_HEIGHT = 400
+IMAGE_FILE = "floorplan.png"
+
+# لازم يكون ترتيبها مطابق لـ ANCHOR_IDS
+ANCHOR_IDS = [1, 2, 3, 4]
+
+ANCHOR_POSITIONS = np.array([
+    [15, 5],     # A1
+    [290, 5],    # A2
+    [165, 625],  # A3
+    [450, 620],  # A4  <-- عدّلها حسب قياساتك
+], dtype=float)
+
+MIN_DISTANCE_CM = 5
+MAX_DISTANCE_CM = 2000
 # ------------------------------------------------ #
 
-# Global variables
-latest_data = None
-latest_signal_strengths = None  # New variable for signal strengths
+latest_distances = None   # list length 4
+latest_rssi = None        # list length 4
 data_lock = threading.Lock()
 server_running = True
 buffer = ""
 
+def valid_distance(d):
+    return (d is not None) and (MIN_DISTANCE_CM <= d <= MAX_DISTANCE_CM)
 
-def trilaterate(distances, anchor_positions):
-    """Calculate tag position using trilateration with 3 anchors."""
+def trilaterate(distances, anchors_xy):
+    distances = np.array(distances, dtype=float)
+    anchors = np.array(anchors_xy, dtype=float)
 
-    def equations(p):
+    def residuals(p):
         x, y = p
-        return [
-            np.sqrt(
-                (x - anchor_positions[0][0]) ** 2 + (y - anchor_positions[0][1]) ** 2
-            )
-            - distances[0],
-            np.sqrt(
-                (x - anchor_positions[1][0]) ** 2 + (y - anchor_positions[1][1]) ** 2
-            )
-            - distances[1],
-            np.sqrt(
-                (x - anchor_positions[2][0]) ** 2 + (y - anchor_positions[2][1]) ** 2
-            )
-            - distances[2],
-        ]
+        return np.hypot(x - anchors[:, 0], y - anchors[:, 1]) - distances
 
-    initial_guess = np.mean(anchor_positions, axis=0)
-
+    initial_guess = np.mean(anchors, axis=0)
     try:
-        result = least_squares(equations, initial_guess, method="lm")
-        return result.x if result.success else None
+        res = least_squares(residuals, initial_guess)
+        return res.x if res.success else None
     except Exception as e:
-        print(f"Trilateration error: {e}")
+        print("Trilateration error:", e)
         return None
 
-
 def wifi_server():
-    """TCP server to receive data from ESP32"""
-    global latest_data, latest_signal_strengths, server_running, buffer
+    global latest_distances, latest_rssi, server_running, buffer
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((HOST, PORT))
         s.listen()
-        print(f"Server listening on {HOST}:{PORT}")
+        s.settimeout(1.0)
+        print("Server listening on {}:{}".format(HOST, PORT))
 
         while server_running:
             try:
                 conn, addr = s.accept()
-                with conn:
-                    print(f"Connected by {addr}")
-                    while server_running:
-                        try:
-                            data = conn.recv(1024)
-                            if not data:
-                                break
-                            decoded = data.decode("utf-8")
-                            buffer += decoded
+            except socket.timeout:
+                continue
 
-                            while "\n" in buffer:
-                                line, buffer = buffer.split("\n", 1)
-                                line = line.strip()
-                                if line:
-                                    try:
-                                        # Parse JSON data
-                                        json_data = json.loads(line)
-                                        anchors = json_data[
-                                            "anchors"
-                                        ]  # Extract the anchors dictionary
-                                        d1 = float(anchors["A1"]["distance"])
-                                        d2 = float(anchors["A2"]["distance"])
-                                        d3 = float(anchors["A3"]["distance"])
-                                        s1 = float(anchors["A1"]["rssi"])
-                                        s2 = float(anchors["A2"]["rssi"])
-                                        s3 = float(anchors["A3"]["rssi"])
-                                        with data_lock:
-                                            latest_data = (d1, d2, d3)
-                                            latest_signal_strengths = (s1, s2, s3)
-
-                                        print(f"Tag ID: {json_data['tag_id']}")
-                                        print(
-                                            f"Received data: d1={d1:.2f} cm, d2={d2:.2f} cm, d3={d3:.2f} cm"
-                                        )
-                                        print(
-                                            f"Signal strengths: s1={s1:.2f} dBm, s2={s2:.2f} dBm, s3={s3:.2f} dBm"
-                                        )
-
-                                    except (
-                                        ValueError,
-                                        KeyError,
-                                        json.JSONDecodeError,
-                                    ) as e:
-                                        print(f"Invalid data: {line} - Error: {e}")
-                        except ConnectionResetError:
-                            print("Client disconnected")
+            print("Connected by", addr)
+            with conn:
+                conn.settimeout(1.0)
+                while server_running:
+                    try:
+                        data = conn.recv(2048)
+                        if not data:
                             break
-            except OSError as e:
-                if server_running:
-                    print(f"Server error: {e}")
-                break
+                        buffer += data.decode("utf-8", errors="ignore")
 
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            line = line.strip()
+                            if not line:
+                                continue
 
-# ---------------- PLOTTING SETUP ---------------- #
+                            try:
+                                j = json.loads(line)
+                                anchors = j["anchors"]  # dict
+
+                                d_list = []
+                                r_list = []
+
+                                # نقرأ حسب ANCHOR_IDS وبنفس الترتيب
+                                for aid in ANCHOR_IDS:
+                                    key = "A{}".format(aid)
+                                    aobj = anchors[key]
+                                    d = float(aobj["distance"])   # filtered_distance عندك
+                                    r = float(aobj.get("rssi", np.nan))
+                                    d_list.append(d)
+                                    r_list.append(r)
+
+                                # فلترة المسافات
+                                if not all(valid_distance(d) for d in d_list):
+                                    print("Invalid distances:", d_list)
+                                    continue
+
+                                with data_lock:
+                                    latest_distances = d_list
+                                    latest_rssi = r_list
+
+                            except Exception as e:
+                                print("Bad line:", line[:120], " err=", e)
+
+                    except socket.timeout:
+                        continue
+                    except ConnectionResetError:
+                        break
+
+            print("Client disconnected")
+
+# ---------------- PLOTTING ---------------- #
 fig, ax = plt.subplots(figsize=(10, 8))
 
-# Load and display room background image
-bg_img = mpimg.imread(IMAGE_FILE)
-img_extent = [0, ROOM_WIDTH, 0, ROOM_HEIGHT]
-ax.imshow(bg_img, extent=img_extent, origin="lower", alpha=0.6, zorder=-1)
+if os.path.exists(IMAGE_FILE):
+    bg = mpimg.imread(IMAGE_FILE)
+    ax.imshow(bg, extent=[0, ROOM_WIDTH, 0, ROOM_HEIGHT], origin="lower", alpha=0.6, zorder=-1)
 
-# Plot anchors and create text annotations for signal strength
 anchor_texts = []
 for i, (x, y) in enumerate(ANCHOR_POSITIONS):
-    color = ["g", "b", "m"][i]
-    ax.plot(x, y, f"{color}^", markersize=12, label=f"Anchor {i + 1}")
-    # Create text object for signal strength, positioned above each anchor
-    txt = ax.text(x, y + 20, "", color=color, ha="center", va="bottom")
-    anchor_texts.append(txt)
+    ax.plot(x, y, "^", markersize=12, linestyle="None", label="A{}".format(ANCHOR_IDS[i]))
+    anchor_texts.append(ax.text(x, y + 20, "", ha="center", va="bottom"))
 
-# Tag and path
-(tag_dot,) = ax.plot([], [], "ro", markersize=10, label="Tag Position")
-(path_line,) = ax.plot([], [], "b-", alpha=0.5, linewidth=1, label="Tag Path")
-
+(tag_dot,) = ax.plot([], [], "o", markersize=10, label="Tag")
+(path_line,) = ax.plot([], [], "-", alpha=0.5, linewidth=1, label="Path")
 path_x, path_y = [], []
 
-# Set fixed room size view
 ax.set_xlim(0, ROOM_WIDTH)
 ax.set_ylim(0, ROOM_HEIGHT)
 ax.set_aspect("equal")
 ax.grid(True, linestyle="--", alpha=0.7)
 ax.legend(loc="upper right")
-ax.set_title("Real-time UWB Tag Position Tracking (3 Anchors)", pad=40)
-ax.set_xlabel("X Position (cm)", labelpad=10)
-ax.set_ylabel("Y Position (cm)", labelpad=10)
+ax.set_title("UWB Tag Tracking (4 Anchors)")
+ax.set_xlabel("X (cm)")
+ax.set_ylabel("Y (cm)")
 
-
-# ---------------- ANIMATION FUNCTION ---------------- #
-def update(frame):
-    global latest_data, latest_signal_strengths, path_x, path_y
+def update(_):
+    global path_x, path_y
 
     with data_lock:
-        if latest_data and latest_signal_strengths:
-            d1, d2, d3 = latest_data
-            s1, s2, s3 = latest_signal_strengths
+        d_list = latest_distances
+        r_list = latest_rssi
 
-            # Update signal strength texts
-            for i, (txt, sig) in enumerate(zip(anchor_texts, (s1, s2, s3))):
-                txt.set_text(f"{sig:.1f} dBm")
+    if not (d_list and r_list):
+        return (tag_dot, path_line) + tuple(anchor_texts)
 
-            pos = trilaterate([d1, d2, d3], ANCHOR_POSITIONS)
-            if pos is not None:
-                x_cm, y_cm = pos
-                print(f"Tag position: x={x_cm:.1f} cm, y={y_cm:.1f} cm")
+    # تحديث RSSI فوق الأنكور
+    for txt, sig in zip(anchor_texts, r_list):
+        if np.isfinite(sig):
+            txt.set_text("{:.1f} dBm".format(sig))
+        else:
+            txt.set_text("")
 
-                tag_dot.set_data([x_cm], [y_cm])
-                path_x.append(x_cm)
-                path_y.append(y_cm)
-                if len(path_x) > 100:
-                    path_x.pop(0)
-                    path_y.pop(0)
-                path_line.set_data(path_x, path_y)
+    pos = trilaterate(d_list, ANCHOR_POSITIONS)
+    if pos is not None:
+        x_cm, y_cm = pos
+        if 0 <= x_cm <= ROOM_WIDTH and 0 <= y_cm <= ROOM_HEIGHT:
+            tag_dot.set_data([x_cm], [y_cm])
+            path_x.append(float(x_cm))
+            path_y.append(float(y_cm))
+            if len(path_x) > 150:
+                path_x.pop(0); path_y.pop(0)
+            path_line.set_data(path_x, path_y)
 
-    return tag_dot, path_line, *anchor_texts
+    return (tag_dot, path_line) + tuple(anchor_texts)
 
-
-# ---------------- MAIN EXECUTION ---------------- #
 if __name__ == "__main__":
-    server_thread = threading.Thread(target=wifi_server, daemon=True)
-    server_thread.start()
+    t = threading.Thread(target=wifi_server, daemon=True)
+    t.start()
 
-    ani = animation.FuncAnimation(
-        fig, update, interval=100, cache_frame_data=False, blit=False
-    )
-
+    ani = animation.FuncAnimation(fig, update, interval=100, cache_frame_data=False, blit=False)
     try:
         plt.tight_layout()
         plt.show()
-    except KeyboardInterrupt:
-        print("\nShutting down server...")
     finally:
         server_running = False
         plt.close()

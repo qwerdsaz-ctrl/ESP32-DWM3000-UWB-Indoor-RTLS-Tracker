@@ -3,24 +3,28 @@
 #include <WiFiClient.h>
 
 // WiFi Configuration
-const char *ssid = "Sxxxxxxxx";
-const char *password = "cxxxxxxxx";
-const char *host = "192.168.xxx.xx"; // Your PC's IP address
+const char *ssid = "Ahmad Jaradat";
+const char *password = "12345670";
+const char *host = "172.20.10.3"; // Your PC's IP address
 const int port = 7007;             // Choose a port number
 WiFiClient client;
 bool wifiConnected = false;
 
+unsigned long stageStartMs = 0;
+#define STAGE_TIMEOUT_MS 15
+
 // SPI Setup
 #define RST_PIN 27
+#define PIN_IRQ 34
 #define CHIP_SELECT_PIN 4
 
 // Scalable Anchor Configuration
-#define NUM_ANCHORS 3 // Change this to scale the system
-#define TAG_ID 10
+#define NUM_ANCHORS 4 // Change this to scale the system
+#define TAG_ID 5
 #define FIRST_ANCHOR_ID 1 // Starting ID for anchors (1, 2, 3, ...)
 
 // Ranging Configuration
-#define FILTER_SIZE 30 // For median filter
+#define FILTER_SIZE 10 // For median filter
 #define MIN_DISTANCE 0
 #define MAX_DISTANCE 1000.0
 
@@ -95,22 +99,21 @@ bool wifiConnected = false;
 #define CLOCK_OFFSET_CHAN_9_CONSTANT -0.1252e-3f
 #define NO_OFFSET 0x0
 #define DEBUG_OUTPUT 0
-static int ANTENNA_DELAY = 16350;
+static int ANTENNA_DELAY = 16600;
 int led_status = 0;
 int destination = 0x0;
 int sender = 0x0;
 
 // Initial Radio Configuration
 int config[] = {
-    CHANNEL_5,         // Channel
-    PREAMBLE_128,      // Preamble Length
-    9,                 // Preamble Code (Same for RX and TX!)
-    PAC8,              // PAC
-    DATARATE_6_8MB,    // Datarate
-    PHR_MODE_STANDARD, // PHR Mode
-    PHR_RATE_850KB     // PHR Rate
+  CHANNEL_5,          // Channel
+  PREAMBLE_128,       // Preamble Length
+  9,                  // Preamble Code (Same for RX and TX)
+  PAC8,               // PAC
+  DATARATE_6_8MB,     // Data rate
+  PHR_MODE_STANDARD,  // PHR Mode
+  PHR_RATE_850KB      // PHR Rate
 };
-
 // Global variables
 static int rx_status;
 static int tx_status;
@@ -1410,10 +1413,10 @@ void setup()
 
     DWM3000.init();
     DWM3000.setupGPIO();
-    DWM3000.setTXAntennaDelay(16350);
+    DWM3000.setTXAntennaDelay(16600);
     DWM3000.setSenderID(TAG_ID);
 
-    Serial.println("> TAG - Three Anchor Ranging System <");
+    Serial.println("> TAG - Four Anchor Ranging System <");
     Serial.println("> With WiFi Communication <\n");
     Serial.println("[INFO] Setup is finished.");
     Serial.print("Antenna delay set to: ");
@@ -1428,40 +1431,46 @@ void loop()
     AnchorData *currentAnchor = getCurrentAnchor();
     int currentAnchorId = getCurrentAnchorId();
 
+    // --- تعديل رقم 1: حماية من التعليق (Timeout Protection) ---
+    // إذا مر وقت طويل في انتظار الرد (مرحلة 1 أو 3)، اقطع الانتظار
+    if (curr_stage == 1 || curr_stage == 3) {
+        if (millis() - stageStartMs > STAGE_TIMEOUT_MS) {
+            switchToNextAnchor();
+            curr_stage = 0;
+            return; 
+        }
+    }
+
     switch (curr_stage)
     {
-    case 0: // Start ranging with current target
-        // Reset timing measurements for current anchor
+    case 0: // Start ranging
         currentAnchor->t_roundA = 0;
         currentAnchor->t_replyA = 0;
 
         DWM3000.setDestinationID(currentAnchorId);
-        DWM3000.ds_sendFrame(1);    // Sends "Poll" (Stage 1)
-        currentAnchor->tx = DWM3000.readTXTimestamp(); // Saves T1 (Time Sent)
-        curr_stage = 1; // Move to wait for response
+        DWM3000.ds_sendFrame(1);    
+        currentAnchor->tx = DWM3000.readTXTimestamp(); 
+        
+        // --- تعديل رقم 2: بدء العداد ---
+        stageStartMs = millis(); 
+        // -----------------------------
+        
+        curr_stage = 1; 
         break;
 
     case 1: // Await first response
-        if (rx_status = DWM3000.receivedFrameSucc())    // Response Received
+        if (rx_status = DWM3000.receivedFrameSucc())
         {
             DWM3000.clearSystemStatus();
             if (rx_status == 1)
             {
                 if (DWM3000.ds_isErrorFrame())
                 {
-                    Serial.print("[WARNING] Error frame from Anchor ");
-                    Serial.print(currentAnchorId);
-                    Serial.print("! Signal strength: ");
-                    Serial.print(DWM3000.getSignalStrength());
-                    Serial.println(" dBm");
+                    // معالجة الخطأ
                     curr_stage = 0;
                 }
                 else if (DWM3000.ds_getStage() != 2)
                 {
-                    Serial.print("[WARNING] Unexpected stage from Anchor ");
-                    Serial.print(currentAnchorId);
-                    Serial.print(": ");
-                    Serial.println(DWM3000.ds_getStage());
                     DWM3000.ds_sendErrorFrame();
                     curr_stage = 0;
                 }
@@ -1472,33 +1481,36 @@ void loop()
             }
             else
             {
-                Serial.print("[ERROR] Receiver Error from Anchor ");
-                Serial.println(currentAnchorId);
-                DWM3000.clearSystemStatus();
+                 // خطأ في الاستقبال
             }
         }
         break;
 
-    case 2: // Response received. Send second ranging
-        currentAnchor->rx = DWM3000.readRXTimestamp();  // Reads T4 (Time Response Arrived)
-        DWM3000.ds_sendFrame(3);    // Sends "Final" (Stage 3)
-        currentAnchor->t_roundA = currentAnchor->rx - currentAnchor->tx;    // Calculate Tag's Round Trip: (Time Response Arrived - Time Poll Sent)
-        currentAnchor->tx = DWM3000.readTXTimestamp();  // Reads T5 (Time Final Sent)
-        currentAnchor->t_replyA = currentAnchor->tx - currentAnchor->rx;    // Calculate Tag's Reply Time: (Time Final Sent - Time Response Arrived)
-
-        curr_stage = 3; // Move to wait for Report
+    case 2: // Send Final
+        currentAnchor->rx = DWM3000.readRXTimestamp();  
+        DWM3000.ds_sendFrame(3);    
+        currentAnchor->t_roundA = currentAnchor->rx - currentAnchor->tx;    
+        currentAnchor->tx = DWM3000.readTXTimestamp();  
+        currentAnchor->t_replyA = currentAnchor->tx - currentAnchor->rx;    
+        
+        DWM3000.clearSystemStatus();
+        DWM3000.standardRX();
+        
+        // --- تعديل رقم 3: إعادة تشغيل العداد للمرحلة القادمة ---
+        stageStartMs = millis(); 
+        // --------------------------------------------------
+        
+        curr_stage = 3; 
         break;
 
-    case 3: // Await second response
-        if (rx_status = DWM3000.receivedFrameSucc())    // Report Received
+    case 3: // Await Report (Second response)
+        if (rx_status = DWM3000.receivedFrameSucc())
         {
             DWM3000.clearSystemStatus();
             if (rx_status == 1)
             {
                 if (DWM3000.ds_isErrorFrame())
                 {
-                    Serial.print("[WARNING] Error frame from Anchor ");
-                    Serial.println(currentAnchorId);
                     curr_stage = 0;
                 }
                 else
@@ -1509,41 +1521,50 @@ void loop()
             }
             else
             {
-                Serial.print("[ERROR] Receiver Error from Anchor ");
-                Serial.println(currentAnchorId);
                 DWM3000.clearSystemStatus();
             }
         }
         break;
-
-    case 4: // Response received. Calculating results
+case 4: // Calculation & Sending
     {
+        // 1. حساب المسافة
         int ranging_time = DWM3000.ds_processRTInfo(
-            currentAnchor->t_roundA,    // Calculated locally in Phase 3
-            currentAnchor->t_replyA,    // Calculated locally in Phase 3
-            DWM3000.read(0x12, 0x04),   // Read from Report Packet (Bytes 4-7)
-            DWM3000.read(0x12, 0x08),   // Read from Report Packet (Bytes 8-11)
+            currentAnchor->t_roundA, 
+            currentAnchor->t_replyA,
+            DWM3000.read(0x12, 0x04), 
+            DWM3000.read(0x12, 0x08), 
             currentAnchor->clock_offset);
 
-        currentAnchor->distance = DWM3000.convertToCM(ranging_time);
+        // 2. تخزين المسافة
+        float raw_dist = DWM3000.convertToCM(ranging_time);
+        
+        // فلترة بسيطة للقيم المنطقية (بين 0 و 50 متر)
+        if(raw_dist > 0 && raw_dist < 5000) { 
+            currentAnchor->distance = raw_dist;
+        }
+        
         currentAnchor->signal_strength = DWM3000.getSignalStrength();
         currentAnchor->fp_signal_strength = DWM3000.getFirstPathSignalStrength();
         updateFilteredDistance(*currentAnchor);
-    }
 
-        // Print current distances
-        printAllDistances();
+        // --- التعديل هنا: السرعة والاستقرار ---
 
-        // Send data over WiFi if all anchors have valid data
-        if (allAnchorsHaveValidData())
+        // 1. اطبع على الشاشة فوراً (عشان تشوف الأرقام تتغير بسرعة)
+        printAllDistances(); 
+
+        // 2. انتقل للأنكر التالي
+        switchToNextAnchor(); 
+
+        // 3. أرسل للواي فاي فقط إذا خلصنا الدورة كاملة (عشان ما يعلق)
+        if (current_anchor_index == 0) 
         {
-            sendDataOverWiFi();
+            sendDataOverWiFi();  
         }
+        // --------------------------------
 
-        // Switch to next anchor
-        switchToNextAnchor();
         curr_stage = 0;
         break;
+    }
 
     default:
         Serial.print("Entered stage (");
